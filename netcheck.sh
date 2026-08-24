@@ -4,7 +4,7 @@
 #  Запуск прямо на проверяемой машине (по SSH):   bash netcheck.sh
 #  Проверить чужой хост:                          bash netcheck.sh 1.2.3.4
 #  Порт для TCP-проверки из мира:                 PORT=443 bash netcheck.sh
-#  Только один зависимый сервис — публичный API check-host.net (ключ не нужен).
+#  Внешние сервисы (без ключей): check-host.net (связь по IPv4), Globalping (связь по IPv6).
 #  Требуется: bash, curl, ping (+ping6 для IPv6), python3 (для разбора JSON).
 #  Ничего не устанавливает и не меняет на машине — только читает и шлёт запросы.
 # ============================================================================
@@ -201,6 +201,90 @@ def verdict(tag,reach,total):
 print()
 print("  "+verdict("РФ",*rr))
 print("  "+verdict("Зарубеж",*ar))
+PY
+fi
+
+# ---------- 5. Связь ПО IPv6 из РФ и из-за рубежа (Globalping) ----------
+# check-host.net умеет только IPv4, поэтому v6-картину берём у зондов Globalping.
+sec "5 · IPv6 ИЗ РФ И ИЗ-ЗА РУБЕЖА (зонды Globalping)"
+# цель v6: env TARGET6 -> аргумент-IPv6 -> имя-хоста-аргумент -> свой глобальный v6
+TARGET6="${TARGET6:-}"
+if [ -z "$TARGET6" ]; then
+  case "$TARGET_ARG" in
+    *:*)        TARGET6="$TARGET_ARG" ;;              # аргумент — сам IPv6
+    "")         TARGET6="${PUB6:-${V6ADDR%%/*}}" ;;   # свой хост → свой глобальный v6
+    *[a-zA-Z]*) TARGET6="$TARGET_ARG" ;;              # аргумент — имя хоста (возьмём AAAA)
+  esac
+fi
+if [ "$have_py" != 1 ]; then
+  printf '  %spython3 не найден — IPv6-раздел пропущен.%s\n' "$RED" "$R"
+elif [ -z "$TARGET6" ]; then
+  printf '  %sНет цели IPv6%s: цель — IPv4-литерал без известного адреса v6.\n' "$YEL" "$R"
+  printf '  %sЗапустите на самом сервере или задайте явно:%s TARGET6=2a0e:… bash netcheck.sh\n' "$D" "$R"
+else
+CH_COLOR=1; [ -z "$B" ] && CH_COLOR=0
+TARGET6="$TARGET6" CH_COLOR="$CH_COLOR" python3 - <<'PY'
+import os,sys,json,time,urllib.request,urllib.error
+T=os.environ["TARGET6"]; COL=os.environ.get("CH_COLOR")=="1"
+def c(s,x): return f"\033[{x}m{s}\033[0m" if COL else s
+API="https://api.globalping.io/v1/measurements"
+def post(body):
+    req=urllib.request.Request(API,data=json.dumps(body).encode(),
+        headers={"Content-Type":"application/json","Accept":"application/json","User-Agent":"netcheck"})
+    return json.load(urllib.request.urlopen(req,timeout=25))
+def get(u):
+    return json.load(urllib.request.urlopen(urllib.request.Request(u,
+        headers={"Accept":"application/json","User-Agent":"netcheck"}),timeout=25))
+opts={"packets":3}
+if ":" not in T: opts["ipVersion"]=6          # имя хоста → форсим AAAA; для v6-литерала не нужно
+body={"type":"ping","target":T,
+      "locations":[{"country":"RU","limit":5},{"magic":"world","limit":10}],
+      "measurementOptions":opts}
+try:
+    d=post(body)
+except urllib.error.HTTPError as e:
+    print("  "+c("Globalping отклонил цель: ","31")+e.read().decode()[:160]); sys.exit()
+except Exception as e:
+    print("  "+c("Globalping недоступен: ","31")+str(e)); sys.exit()
+mid=d.get("id")
+if not mid: print("  "+c("нет ответа Globalping","31")); sys.exit()
+r={}
+for _ in range(24):
+    try: r=get(f"{API}/{mid}")
+    except Exception: r={}
+    if r.get("status")!="in-progress": break
+    time.sleep(1.5)
+print(c(f"  Цель IPv6: {T}   ICMPv6-ping, зонды РФ + мир","2"))
+RU=[]; AB=[]
+for it in (r.get("results") or []):
+    p=it.get("probe") or {}; res=it.get("result") or {}; st=res.get("stats") or {}
+    row=(p.get("country") or "?", p.get("city") or "", st.get("loss"), st.get("avg"))
+    (RU if row[0]=="RU" else AB).append(row)
+def bucket(name,rs):
+    if not rs:
+        print(c(f"  ── {name} ──  (нет зондов)","2")); return (0,0)
+    print(c(f"  ── {name} ──","1;35"))
+    reach=0
+    for cc,city,loss,avg in sorted(rs,key=lambda x:(x[0],x[1])):
+        if loss is None:
+            ps=c("нет данных".ljust(12),"31")
+        else:
+            pc="32" if loss==0 else ("33" if loss<100 else "31")
+            ps=c((f"{loss:.0f}%loss" if loss else f"{(avg or 0):.0f}мс").ljust(12),pc)
+            if loss<100: reach+=1
+        print(f"    {(cc+' '+city)[:26].ljust(28)}{ps}")
+    print(c(f"    итог: {reach}/{len(rs)} узлов видят хост по IPv6","2"))
+    return (reach,len(rs))
+rr=bucket("ИЗ РОССИИ",RU); ar=bucket("ИЗ-ЗА РУБЕЖА",AB)
+def verdict(tag,reach,total):
+    if total==0: return f"{tag} v6: нет зондов"
+    if reach==0: return c(f"{tag} v6: НЕДОСТУПЕН (0/{total})","1;31")
+    if reach<total: return c(f"{tag} v6: частично {reach}/{total}","1;33")
+    return c(f"{tag} v6: доступен {reach}/{total}","1;32")
+print()
+print("  "+verdict("РФ",*rr))
+print("  "+verdict("Зарубеж",*ar))
+print(c(f"    measurement: {mid}","2"))
 PY
 fi
 
